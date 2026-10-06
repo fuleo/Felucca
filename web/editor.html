@@ -316,6 +316,10 @@
     <h2 data-t="projects" data-ic="symbol_folder"></h2>
     <p class="dim" data-t="projHelp"></p>
     <div class="slots" id="slots"></div>
+    <h2 data-t="exportSong" data-ic="symbol_download"></h2>
+    <p class="dim" data-t="exportHelp"></p>
+    <p class="bar"><button id="expmid" data-t="exportMidi" data-ic="symbol_download"></button>
+      <button id="expit" data-t="exportIt" data-ic="symbol_download"></button></p>
     <div id="backup-panel" style="margin-top:16px">
       <h2 data-t="backupTitle"></h2>
       <p class="bar"><button id="backup-export" data-t="backupExport"></button>
@@ -2349,6 +2353,294 @@ function devicePresetRows(info, names, preferences) {
 }
 
 /*PROTO-END*/
+/*SONG-BEGIN*/
+/* ------------------------------------------------------------ song export --- */
+/* The four tracks as a song file: Standard MIDI File (.mid, type 1) and Impulse Tracker (.it).
+   Pure functions, no DOM and no device: songEvents() times every note as seq.c seq_step plays it
+   (DIV, LEN, GATE, track + global swing, ties, slides, accents, lane hits, chance), and the writers
+   only lay those events out. The patterns are the tracks' own steps (what TRACK_STEP reads); a
+   running song chain plays other project slots and is not followed here.
+   A song: { bpm, swing (G_SWING), name, tracks: [{ name, engineName, drum (the DRUM engine), level 0..127,
+   pan -64..63, mute, len 1..64, div 0..9 (N_DIV), swing 0..100, gate 1..127,
+   steps: [{ n, notes[4], time, flags, vel, hit, acc, chance }] }] } */
+const SONG = {
+  PPQ: 96,                                   /* MIDI ticks per beat: every DIV step is a whole number */
+  DIV_DEN: [1, 2, 4, 8, 3, 6],               /* fx.c DIV_DEN: N_DIV 0..5 is 1 / DEN beats, 6..9 2^(div-5) beats */
+  LANE_NOTE: [36, 38, 39, 42, 46, 45, 37, 56],   /* eng_drum.c DRUM_LANE_NOTE: the GM note a lane hit plays */
+  ST_NOTE: 0, ST_TIE: 1, ST_REST: 2,
+  SF_ACCENT: 1, SF_SLIDE: 2,
+  SWING_MAX: 100,                            /* core.h track_swing: own + global, at most 100 */
+  MAX_TICKS: 96 * 4 * 64,                    /* at most 64 bars of 4/4 when the loop lengths do not meet */
+};
+const songGcd = (a, b) => (b ? songGcd(b, a % b) : a);
+const songLcm = (a, b) => (a / songGcd(a, b)) * b;
+const songStepTicks = (div) => ((div |= 0) < 6 ? SONG.PPQ / SONG.DIV_DEN[div] : div < 10 ? SONG.PPQ << (div - 5) : SONG.PPQ / SONG.DIV_DEN[div % 6]);
+const songChance = (s) => (!s.chance && s.chance !== 0 ? 100 : s.chance);   /* parse: 0..100 (100 = always) */
+/* what a NOTE step strikes, as seq_step builds it: its notes (slots 0..3), then its lane hits (slots 4..11) */
+function songStrikes(s) {
+  const vel = s.flags & SONG.SF_ACCENT ? 127 : s.vel || 96, out = [];
+  for (let i = 0; i < Math.min(4, s.n | 0); i++) out.push({ note: s.notes[i], vel, slot: i });
+  for (let l = 0; l < 8; l++) if ((s.hit >> l) & 1) out.push({ note: SONG.LANE_NOTE[l], vel: (s.acc >> l) & 1 ? 127 : vel, slot: 4 + l });
+  return out;
+}
+
+/* -> { ppq, total (ticks), tracks: [{ ...track, stepTicks, has, events: [{ t, dur, note, vel, slot, slide, chance }] }] }.
+   slot: where the note came from in its step (0..3 a note, 4..11 a lane hit), so writers can give each
+   its own channel. slide: the note glides in from the one before it. chance: the step's (1..100; a step at 0
+   never plays and is left out) -- the files play every note that can sound. */
+function songEvents(song, opt = {}) {
+  const ppq = SONG.PPQ, out = [];
+  let total = 0;
+  const plays = (s) => s && s.time === SONG.ST_NOTE && ((s.n | 0) > 0 || (s.hit | 0) > 0) && songChance(s) > 0;
+  for (const tr of song.tracks) {
+    const len = Math.max(1, Math.min(64, tr.len | 0 || 16));
+    const stepTicks = songStepTicks(tr.div);
+    const has = tr.steps.slice(0, len).some(plays);
+    out.push({ ...tr, len, stepTicks, has, events: [] });
+    if (has) total = total ? songLcm(total, len * stepTicks) : len * stepTicks;
+  }
+  if (!total) return { ppq, total: 0, tracks: out };
+  if (opt.loops) total = Math.max(...out.filter((t) => t.has).map((t) => t.len * t.stepTicks)) * opt.loops;
+  total = Math.min(total, opt.maxTicks || SONG.MAX_TICKS);
+  for (const tr of out) {
+    if (!tr.has) continue;
+    const { len, stepTicks } = tr;
+    const swAmt = Math.max(0, Math.min(SONG.SWING_MAX, (tr.swing | 0) + (song.swing | 0)));
+    const sw = Math.round(swAmt * stepTicks / 250);
+    const start = (k) => k * stepTicks + ((k % len) & 1 ? sw : 0);   /* swing_step_len: odd steps start late */
+    const step = (k) => tr.steps[k % len] || { n: 0, time: SONG.ST_REST };
+    const gate = Math.max(1, Math.round(stepTicks * (tr.gate || 64) / 128));
+    const nsteps = Math.ceil(total / stepTicks);
+    for (let k = 0; k < nsteps; k++) {
+      const s = step(k), t0 = start(k);
+      if (t0 >= total || !plays(s)) continue;
+      let last = k;                                   /* the last step these notes cover: NOTE then TIEs */
+      while (last + 1 < k + len && step(last + 1).time === SONG.ST_TIE && start(last + 1) < total) last++;
+      const held = step(last).flags & SONG.SF_SLIDE;  /* seq_hold: kept until the next step plays */
+      /* a NOTE step ends at its gate; a TIE step at gate + half a step (seq_step); never past the next step */
+      let end = held ? start(last + 1) : Math.min(start(last) + gate + (last > k ? stepTicks / 2 : 0), start(last + 1));
+      const prev = step(k - 1 + len);
+      const slideIn = k > 0 && prev.time !== SONG.ST_REST && (prev.flags & SONG.SF_SLIDE) !== 0 && plays(prev);
+      end = Math.min(end, total);
+      for (const x of songStrikes(s))
+        tr.events.push({ t: t0, dur: Math.max(1, end - t0), note: x.note, vel: x.vel, slot: x.slot, slide: slideIn, chance: songChance(s) });
+    }
+  }
+  return { ppq, total, tracks: out };
+}
+
+/* ---- Standard MIDI File, type 1: a tempo track, then one track per Felucca track that has notes */
+function songVlq(n) {
+  const b = [n & 0x7F];
+  while ((n >>= 7)) b.unshift((n & 0x7F) | 0x80);
+  return b;
+}
+const songAscii = (s, n) => Array.from(String(s).replace(/[^\x20-\x7E]/g, "?").slice(0, n), (c) => c.charCodeAt(0));
+function songChunk(id, body) {
+  const n = body.length;
+  return [...songAscii(id, 4), (n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255, ...body];
+}
+function songTrackBody(evs) {                         /* evs: [{ t, b: [bytes], o }] (o orders equal times) */
+  evs.sort((a, b) => a.t - b.t || a.o - b.o);
+  const body = [];
+  let now = 0;
+  for (const e of evs) { body.push(...songVlq(e.t - now), ...e.b); now = e.t; }
+  body.push(0, 0xFF, 0x2F, 0x00);
+  return body;
+}
+function songToMidi(song, opt = {}) {
+  const ev = songEvents(song, opt), tracks = [];
+  const us = Math.round(60000000 / Math.max(1, song.bpm || 120));
+  const meta = (type, data) => [0xFF, type, ...songVlq(data.length), ...data];
+  tracks.push(songChunk("MTrk", songTrackBody([
+    { t: 0, o: 0, b: meta(0x03, songAscii(song.name || "Felucca", 64)) },
+    { t: 0, o: 0, b: meta(0x58, [4, 2, 24, 8]) },
+    { t: 0, o: 0, b: meta(0x51, [(us >> 16) & 255, (us >> 8) & 255, us & 255]) },
+    { t: ev.total, o: 9, b: meta(0x01, songAscii("loop end", 16)) },
+  ])));
+  ev.tracks.forEach((tr, ti) => {
+    if (!tr.has) return;
+    const ch = tr.drum ? 9 : ti % 16;               /* track i on channel i + 1 (seq.c trk_midi_ch); a DRUM kit on 10 (GM) */
+    const name = `${tr.name}${tr.mute ? " (muted)" : ""}`;
+    const evs = [
+      { t: 0, o: 0, b: meta(0x03, songAscii(name, 64)) },
+      { t: 0, o: 1, b: [0xB0 | ch, 7, Math.max(0, Math.min(127, tr.level ?? 100))] },
+      { t: 0, o: 1, b: [0xB0 | ch, 10, Math.max(0, Math.min(127, (tr.pan | 0) + 64))] },
+    ];
+    for (const e of tr.events) {
+      /* a slide overlaps the next note by a tick, so a mono synth plays it legato; never for the same pitch */
+      const over = tr.events.some((n) => n.t === e.t + e.dur && n.slide && n.note !== e.note) ? 1 : 0;
+      evs.push({ t: e.t, o: 3, b: [0x90 | ch, e.note & 0x7F, Math.max(1, e.vel & 0x7F)] });
+      evs.push({ t: e.t + e.dur + over, o: 2, b: [0x80 | ch, e.note & 0x7F, 0] });
+    }
+    tracks.push(songChunk("MTrk", songTrackBody(evs)));
+  });
+  const hdr = songChunk("MThd", [0, 1, 0, tracks.length, (ev.ppq >> 8) & 255, ev.ppq & 255]);
+  return Uint8Array.from([...hdr, ...tracks.flat()]);
+}
+
+/* ---- Impulse Tracker (.it, sample mode). Rows: R per beat, R = lcm(4, the DIVs used), so every step
+   starts on a row; speed 24 / R keeps tempo = BPM. Swing lands as SDx (note delay), the gate as SCx
+   (note cut) or ^^^, a slide as Gxx (tone portamento). Each note / lane slot of a track gets its own channel.
+   Sounds: Felucca's engines are synthesis, so each synth track gets a stand-in sample (a looped single
+   cycle chosen by engine) and a DRUM track a synthesized hit per GM note, or the caller's own samples
+   (opt.samples[trackIndex] = { pcm: Int16Array, rate, loop: [begin, end] | null, name }). */
+const SONG_RATE = 22050;
+const SONG_GM = { 35: "KICK2", 36: "KICK", 37: "RIM", 38: "SNARE", 39: "CLAP", 40: "SNARE2", 42: "HAT CL", 44: "HAT PD",
+  45: "TOM", 46: "HAT OP", 49: "CRASH", 51: "RIDE", 56: "BELL" };
+function songRng(seed) { let s = seed >>> 0 || 1; return () => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296) * 2 - 1; }
+function songCycle(engine) {                         /* one cycle of 256 at C-5: C5Speed 66976 */
+  const N = 256, a = new Float64Array(N), add = (h, g, ph = 0) => { for (let i = 0; i < N; i++) a[i] += g * Math.sin(2 * Math.PI * h * i / N + ph); };
+  const e = String(engine || "").toUpperCase();
+  if (e === "ANALOG" || e === "TRIO") for (let h = 1; h <= 24; h++) add(h, 1 / h);       /* saw */
+  else if (e === "LOFI") for (let h = 1; h <= 23; h += 2) add(h, 1 / h);                 /* square */
+  else if (e === "PHASE") for (let h = 1; h <= 24; h++) add(h, Math.sin(Math.PI * h / 4) / h);   /* 25 % pulse */
+  else if (e === "DIGITAL" || e === "FM6") for (let i = 0; i < N; i++) a[i] = Math.sin(2 * Math.PI * i / N + 1.5 * Math.sin(4 * Math.PI * i / N));
+  else if (e === "VOICE") { const f = [[2.8, 1], [4.4, 0.5], [9.6, 0.25]]; for (let h = 1; h <= 24; h++) add(h, f.reduce((g, [c, w]) => g + w / (1 + (h - c) ** 2), 0)); }
+  else if (e === "WHEEL") [1, 2, 3, 4, 6, 8].forEach((h, i) => add(h, [1, 0.8, 0.6, 0.5, 0.3, 0.25][i]));   /* drawbars */
+  else if (e === "SAMPLE" || e === "SLICE") add(1, 1);
+  else for (let h = 1; h <= 23; h += 2) add(h, (((h - 1) / 2) & 1 ? -1 : 1) / (h * h));   /* triangle */
+  const peak = Math.max(...a.map(Math.abs)) || 1;
+  return { pcm: Int16Array.from(a, (v) => Math.round(v / peak * 22000)), rate: 66976, loop: [0, N], name: `${e || "SYNTH"} (stand-in)` };
+}
+function songDrum(note) {                            /* a short synthesized hit for GM drum note */
+  const rnd = songRng(note * 7919), R = SONG_RATE;
+  const make = (sec, f) => { const n = Math.round(sec * R), o = new Float64Array(n); for (let i = 0; i < n; i++) o[i] = f(i / R, i, n); return o; };
+  let a;
+  if (note === 35 || note === 36) { let ph = 0; a = make(0.35, (t) => { ph += 2 * Math.PI * (45 + 110 * Math.exp(-t * 30)) / R; return Math.sin(ph) * Math.exp(-t * 9); }); }
+  else if (note === 38 || note === 40) a = make(0.2, (t) => (0.6 * rnd() + 0.5 * Math.sin(2 * Math.PI * 185 * t)) * Math.exp(-t * 22));
+  else if (note === 39) a = make(0.18, (t) => rnd() * Math.exp(-((t % 0.012) * 260)) * Math.exp(-t * 14));
+  else if (note === 42 || note === 44) { let p = 0; a = make(0.06, (t) => { const n = rnd(), h = n - p; p = n; return h * Math.exp(-t * 70); }); }
+  else if (note === 46) { let p = 0; a = make(0.3, (t) => { const n = rnd(), h = n - p; p = n; return h * Math.exp(-t * 9); }); }
+  else if (note === 49 || note === 52 || note === 55 || note === 57) { let p = 0; a = make(0.9, (t) => { const n = rnd(), h = n - p; p = n; return h * Math.exp(-t * 3.5); }); }
+  else if (note === 51 || note === 59 || note === 53 || note === 56) a = make(0.6, (t) => (0.4 * rnd() + 0.5 * Math.sin(2 * Math.PI * 3150 * t)) * Math.exp(-t * 5));
+  else if (note >= 41 && note <= 50) { const f0 = 80 + (note - 41) * 22; let ph = 0; a = make(0.3, (t) => { ph += 2 * Math.PI * f0 * (1 + 0.5 * Math.exp(-t * 25)) / R; return Math.sin(ph) * Math.exp(-t * 10); }); }
+  else a = make(0.08, (t) => (0.5 * rnd() + 0.5 * Math.sin(2 * Math.PI * (400 + note * 12) * t)) * Math.exp(-t * 40));
+  const peak = Math.max(...a.map(Math.abs)) || 1;
+  return { pcm: Int16Array.from(a, (v) => Math.round(v / peak * 26000)), rate: R, loop: null, name: SONG_GM[note] || `DRUM ${note}` };
+}
+function songToIT(song, opt = {}) {
+  const ev = songEvents(song, opt);
+  const used = ev.tracks.filter((t) => t.has);
+  const R = used.reduce((r, t) => songLcm(r, Math.max(1, SONG.PPQ / songStepTicks(t.div) | 0)), 4);
+  const rowTicks = ev.ppq / R, speed = Math.max(1, 24 / R), itTick = rowTicks / speed;
+  const rows = Math.max(1, Math.ceil(ev.total / rowTicks));
+  const perPat = R * 16 <= 200 ? R * 16 : R * 8;
+  const npat = Math.ceil(rows / perPat);
+  const samples = [], chans = [];                    /* chans[c] = { pan, vol, mute } */
+  const cells = new Map();                           /* row -> Map(channel -> cell) */
+  const cell = (row, ch) => { if (!cells.has(row)) cells.set(row, new Map()); const m = cells.get(row); if (!m.has(ch)) m.set(ch, {}); return m.get(ch); };
+  const drumSmp = new Map();
+  ev.tracks.forEach((tr, ti) => {
+    if (!tr.has) return;
+    const slots = [...new Set(tr.events.map((e) => e.slot))].sort((a, b) => a - b);
+    const chOf = new Map(slots.map((s, i) => [s, chans.length + i]));
+    const pan = Math.round(((tr.pan | 0) + 64) * 64 / 127), vol = Math.round(Math.max(0, Math.min(127, tr.level ?? 100)) * 64 / 127);
+    for (const s of slots) chans.push({ pan, vol, mute: !!tr.mute });
+    let smp = 0;
+    if (!tr.drum) { samples.push((opt.samples && opt.samples[ti]) || songCycle(tr.engineName)); smp = samples.length; }
+    const lastOn = new Map();                        /* channel -> the end tick of the note sounding there */
+    const evs = [...tr.events].sort((a, b) => a.t - b.t);
+    for (const e of evs) {
+      const ch = chOf.get(e.slot);
+      let sn = smp;
+      if (tr.drum) {
+        if (!drumSmp.has(e.note)) { samples.push(songDrum(e.note)); drumSmp.set(e.note, samples.length); }
+        sn = drumSmp.get(e.note);
+      }
+      const row = Math.floor(e.t / rowTicks), delay = Math.round((e.t - row * rowTicks) / itTick);
+      const c = cell(row, ch);
+      c.note = tr.drum ? 60 : Math.max(0, Math.min(119, e.note));
+      c.ins = sn;
+      c.vol = Math.max(1, Math.round(e.vel * 64 / 127));
+      if (e.slide && !tr.drum && (lastOn.get(ch) ?? -1) >= e.t) { c.cmd = 7; c.param = 0x40; }      /* Gxx */
+      else if (delay > 0 && delay < speed) { c.cmd = 19; c.param = 0xD0 | delay; }                /* SDx */
+      const end = e.t + e.dur;
+      lastOn.set(ch, end);
+      const erow = Math.floor(end / rowTicks), cut = Math.round((end - erow * rowTicks) / itTick);
+      const next = evs.find((n) => n.slot === e.slot && n.t >= e.t + 1 && n.t <= end + rowTicks);
+      if (next && Math.floor(next.t / rowTicks) <= erow) continue;    /* the next note takes the channel */
+      if (erow >= rows) continue;
+      if (cut > 0 && cut < speed && erow === row) { if (!c.cmd) { c.cmd = 19; c.param = 0xC0 | cut; } }
+      else if (cut > 0 && cut < speed) { const x = cell(erow, ch); if (x.note == null && !x.cmd) { x.cmd = 19; x.param = 0xC0 | cut; } }
+      else { const x = cell(erow, ch); if (x.note == null) x.note = 254; }                       /* ^^^ */
+    }
+  });
+  if (chans.length > 64) chans.length = 64;
+  const pats = [];
+  for (let p = 0; p < npat; p++) {
+    const n = Math.min(perPat, rows - p * perPat), body = [];
+    for (let r = 0; r < n; r++) {
+      const m = cells.get(p * perPat + r);
+      if (m) for (const [ch, c] of [...m.entries()].sort((a, b) => a[0] - b[0])) {
+        if (ch >= 64) continue;
+        const mask = (c.note != null ? 1 : 0) | (c.ins ? 2 : 0) | (c.vol != null ? 4 : 0) | (c.cmd ? 8 : 0);
+        if (!mask) continue;
+        body.push((ch + 1) | 0x80, mask);
+        if (mask & 1) body.push(c.note);
+        if (mask & 2) body.push(c.ins);
+        if (mask & 4) body.push(c.vol);
+        if (mask & 8) body.push(c.cmd, c.param & 255);
+      }
+      body.push(0);
+    }
+    pats.push({ rows: n, body });
+  }
+  /* layout: header, orders, offsets, sample headers, patterns, sample data */
+  const u16 = (v) => [v & 255, (v >> 8) & 255], u32 = (v) => [v & 255, (v >>> 8) & 255, (v >>> 16) & 255, (v >>> 24) & 255];
+  const pad = (a, n) => { const o = a.slice(0, n); while (o.length < n) o.push(0); return o; };
+  const ord = [...Array(npat).keys(), 255];
+  const hdrLen = 0xC0 + ord.length + 4 * samples.length + 4 * pats.length;
+  const smpHdrAt = samples.map((_, i) => hdrLen + i * 0x50);
+  let at = hdrLen + samples.length * 0x50;
+  const patAt = pats.map((p) => { const o = at; at += 8 + p.body.length; return o; });
+  const dataAt = samples.map((s) => { const o = at; at += s.pcm.length * 2; return o; });
+  const tempo = Math.max(31, Math.min(255, Math.round((song.bpm || 120) * speed * R / 24)));
+  const out = [];
+  out.push(...songAscii("IMPM", 4), ...pad(songAscii(song.name || "Felucca", 25), 26), Math.min(255, R), Math.min(255, R * 4),
+    ...u16(ord.length), ...u16(0), ...u16(samples.length), ...u16(pats.length),
+    ...u16(0x0214), ...u16(0x0214), ...u16(0x09), ...u16(0), 128, 48, speed, tempo, 128, 0, ...u16(0), ...u32(0), ...u32(0));
+  for (let c = 0; c < 64; c++) out.push(c < chans.length ? chans[c].pan | (chans[c].mute ? 128 : 0) : 32 | 128);
+  for (let c = 0; c < 64; c++) out.push(c < chans.length ? chans[c].vol : 64);
+  out.push(...ord);
+  for (const o of smpHdrAt) out.push(...u32(o));
+  for (const o of patAt) out.push(...u32(o));
+  samples.forEach((s, i) => {
+    const lp = s.loop && s.loop[1] > s.loop[0];
+    out.push(...songAscii("IMPS", 4), ...pad(songAscii(`SMP${i + 1}.RAW`, 12), 12), 0, 64, 0x01 | 0x02 | (lp ? 0x10 : 0), 64,
+      ...pad(songAscii(s.name || `SAMPLE ${i + 1}`, 25), 26), 0x01, 0,
+      ...u32(s.pcm.length), ...u32(lp ? s.loop[0] : 0), ...u32(lp ? s.loop[1] : 0), ...u32(s.rate),
+      ...u32(0), ...u32(0), ...u32(dataAt[i]), 0, 0, 0, 0);
+  });
+  for (const p of pats) out.push(...u16(p.body.length), ...u16(p.rows), 0, 0, 0, 0, ...p.body);
+  for (const s of samples) for (const v of s.pcm) out.push(v & 255, (v >> 8) & 255);
+  return Uint8Array.from(out);
+}
+
+/* the song as the device has it: TRACK (engines, presets, levels, mutes), TRACK_DUMP (each track's
+   parameters) and TRACK_STEP (its steps, with the v5 hits and the v7 chance), plus the globals of the last
+   DUMP. ids: parameter indices by label, from the descriptors: { len, div, swing, gate, pan } (P_*) and
+   { gbpm, gswing } (G_*). onStep(k, n) reports progress. */
+async function readSong(rq, info, names, g, ids, onStep = () => {}) {
+  const tr = parse[CMD.TRACK](await rq(req.track()));
+  const song = { bpm: g[ids.gbpm] || 120, swing: g[ids.gswing] | 0, name: "Felucca", tracks: [] };
+  const total = tr.ntrk * info.nstep;
+  for (let i = 0; i < tr.ntrk; i++) {
+    const d = parse[CMD.TRACK_DUMP](await rq(req.trackDump(i)), info);
+    const engineName = info.engines[d.engine] || "";
+    const presetName = (names[d.engine] || [])[d.preset] || "";
+    const steps = [];
+    for (let k = 0; k < info.nstep; k++) {
+      steps.push(parse[CMD.TRACK_STEP](await rq(req.trackStep(i, k))));
+      onStep(i * info.nstep + k + 1, total);
+    }
+    song.tracks.push({ name: `${i + 1} ${engineName}${presetName ? " " + presetName : ""}`, engineName, drum: engineName === "DRUM",
+      level: tr.tracks[i].level, mute: !!tr.tracks[i].mute, pan: ids.pan == null ? 0 : d.p[ids.pan],
+      len: d.p[ids.len], div: d.p[ids.div], swing: d.p[ids.swing], gate: d.p[ids.gate], steps });
+  }
+  return song;
+}
+/*SONG-END*/
 
 /* ===================================================================== UI === */
 if (typeof document !== "undefined") (() => {
@@ -2495,6 +2787,9 @@ const TEXT = {
     mixer: "ミキサー", mixHelp: "本体の MIXER ページと同じ 4 トラック。フェーダーはレベル。パンはどのトラックも選択を変えずに書き込みます（0.8 のファームウェアでは一瞬そのトラックを選びます）。REC は本体での録音待機の表示です。",
     level: "レベル", pan: "パン", mute: "ミュート", rec: "REC", selectTrack: "選択", selectedTrack: "選択中",
     projHelp: "プロジェクトは本体の状態をまとめて保存します: 4 トラックの音色とパターン、曲の並び順、選択中のトラック、グローバル設定。",
+    exportSong: "曲を書き出す", exportMidi: "MIDI ファイル (.mid)", exportIt: "トラッカー (.it)", readingSong: "曲を読み込み中 ",
+    exportHelp: "4 トラックの現在のパターンを 1 曲として書き出します（ステップ・タイ・スライド・アクセント・ドラムのヒット・スウィング・ゲート込み。チャンスのあるステップは常に鳴る扱い）。.mid は DAW 用、.it は OpenMPT / Schism Tracker 用で、各トラックには代わりのサンプルが入ります（Felucca のエンジンは合成音のため）。",
+    exported: "書き出しました: ", noSong: "書き出すノートがありません", needTracks: "このファームウェアはトラックの読み出しに対応していません（v3 以降が必要）",
     slot: "スロット", songTitle: "ソング", songHelp: "保存スロットのパターンと繰り返す回数を順に並べます。音色は現在のまま。並び順を残すには、上のプロジェクトを保存してください。切替はトラック1のパターン終端、曲末で停止します。", songAdd: "行を追加", songRemove: "最後の行を削除", songPlay: "先頭から再生", songStop: "停止", songReps: "回", songEmpty: "行を追加してください", songBusy: "停止してから編集してください", songInvalid: "スロットと回数を確認してください", songPlaying: "再生中の行", songSaved: "並び順を変更しました。プロジェクトを保存すると残せます。",
     system: "システム", firmware: "ファームウェア", sync: "同期", tracksN: "トラック", stepsN: "ステップ数", enginesL: "エンジン",
     smpSlots: "サンプルスロット", userBank: "ユーザープリセット", none: "なし",
@@ -2589,6 +2884,9 @@ const TEXT = {
     mixer: "Mixer", mixHelp: "The four tracks of the device's MIXER page. The fader is the level. Pan is written to any track without changing the selection (firmware 0.8: by selecting it for a moment). REC shows a track armed for live recording on the device.",
     level: "Level", pan: "Pan", mute: "Mute", rec: "REC", selectTrack: "Select", selectedTrack: "Selected",
     projHelp: "A project keeps the sounds and patterns of all four tracks, the song chain, the selected track and the global settings.",
+    exportSong: "Export song", exportMidi: "MIDI file (.mid)", exportIt: "Tracker (.it)", readingSong: "Reading the song ",
+    exportHelp: "Writes the four tracks' current patterns as one song, with steps, ties, slides, accents, drum hits, swing and gate (a step with a chance always plays). .mid is for a DAW; .it is for OpenMPT or Schism Tracker, with a stand-in sample per track (Felucca's engines are synthesis, not samples).",
+    exported: "Exported: ", noSong: "No notes to export", needTracks: "This firmware cannot read tracks (needs v3 or later)",
     slot: "Slot", songTitle: "Song", songHelp: "Arrange patterns from saved slots and choose their repeats. The current sounds stay. Save a project above to keep the chain. Rows change at the end of track 1; the song stops at the end.", songAdd: "Add row", songRemove: "Remove last row", songPlay: "Play from start", songStop: "Stop", songReps: "repeats", songEmpty: "Add a row first", songBusy: "Stop before editing", songInvalid: "Check slots and repeats", songPlaying: "Playing row", songSaved: "Chain changed. Save a project to keep it.",
     system: "System", firmware: "Firmware", sync: "Sync", tracksN: "Tracks", stepsN: "Steps", enginesL: "Engines",
     smpSlots: "Sample slots", userBank: "User presets", none: "none",
@@ -4314,6 +4612,37 @@ $("savefile").addEventListener("click", () => {
     steps: dev.steps.map((s) => ({ n: s.n, notes: s.notes.slice(), time: s.time, flags: s.flags, vel: s.vel })) };
   download(`felucca-${fileSlug(data.engineName || "patch")}-${fileSlug(data.presetName || preset)}.json`, data);
 });
+/* the whole song (all four tracks) as .mid / .it, read with TRACK / TRACK_DUMP / TRACK_STEP */
+function songIds() {
+  const lab = (descs, l) => descs.findIndex((d) => d && d.label === l);
+  const len = pSlen(), at = (k, l) => (dev.pdesc[len + k] && dev.pdesc[len + k].label === l ? len + k : lab(dev.pdesc, l));
+  const gbpm = dev.gdesc.findIndex((d) => d && d.fmt === F.BPM);
+  const pan = lab(dev.pdesc, "PAN");
+  return { len, div: at(1, "DIV"), swing: at(2, "SWG"), gate: at(3, "GATE"), pan: pan >= 0 ? pan : null,
+    gbpm: gbpm >= 0 ? gbpm : 0, gswing: dev.gdesc[gbpm + 1] && dev.gdesc[gbpm + 1].label === "SWG" ? gbpm + 1 : lab(dev.gdesc, "SWG") };
+}
+function downloadBytes(name, bytes, type) {
+  const a = el("a", { href: URL.createObjectURL(new Blob([bytes], { type })), download: name });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+async function exportSong(kind) {
+  if (!dev) return;
+  if (!hasTracks()) { sayK("needTracks"); return; }
+  busy++;
+  try {
+    const song = await readSong(rq, dev.info, dev.names, dev.dump.g, songIds(), (k, n) => { if (k % 16 === 0) sayK("readingSong", `${k}/${n}`); });
+    if (!songEvents(song).total) { sayK("noSong"); return; }
+    const name = `felucca-song-${today()}.${kind}`;
+    if (kind === "mid") downloadBytes(name, songToMidi(song), "audio/midi");
+    else downloadBytes(name, songToIT(song), "audio/x-it");
+    sayK("exported", name);
+  } catch (err) { report(err); } finally { busy--; }
+}
+$("expmid").addEventListener("click", () => exportSong("mid"));
+$("expit").addEventListener("click", () => exportSong("it"));
 $("loadfile").addEventListener("click", () => { $("file").value = ""; $("file").click(); });
 $("file").addEventListener("change", async () => {
   const f = $("file").files[0];

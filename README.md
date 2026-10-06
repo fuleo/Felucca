@@ -53,7 +53,7 @@ Multi-engine synthesizer firmware for the M-VAVE FM-1. Please report what you fi
 - **MIDI:** USB and TRS MIDI in; channels 1–4 play tracks 1–4 (other channels the selected track),
   and the keys send on the track's channel; pitch bend, sustain, panic; clock from internal, USB or TRS
 - **Web:** editor for every parameter (with a 6-operator FM patch editor), step grid, mixer,
-  preset library, sample upload and recording with trim; full backup and restore; return to the
+  preset library, sample upload and recording with trim; full backup and restore; song export to MIDI (`.mid`) and Impulse Tracker (`.it`); return to the
   official firmware
 
 ## Controls
